@@ -1,0 +1,202 @@
+'use strict';
+
+let request = require("request");
+let Iconv = require('iconv').Iconv;
+let jsdom = require("jsdom");
+let co = require("co");
+
+let fs = require('fs');
+let http = require('http');
+let https = require('https');
+
+let iconv = new Iconv('GBK', 'UTF-8//TRANSLIT//IGNORE');
+let window = jsdom.jsdom('<div></div>').defaultView;
+let jqueryConstructor = require('jquery');
+let $ = jqueryConstructor(window);
+let jar = request.jar();
+
+
+let bbsUrl = "";
+let forumId = process.argv.length > 2 ? process.argv[2]:16;
+let workerCount = 6;
+let pageCount = process.argv.length > 3 ? process.argv[3]: 2;
+let curPage = 1;
+let firstPageJump = 5;
+let outputPath = '' + forumId + '/';
+let headers = {
+	'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/46.0.2490.86 Safari/537.36'
+};
+
+function getForumUrl(page){
+	return bbsUrl + 'thread0806.php?fid=' + forumId + '&search=&page=' + curPage;
+}
+
+let req = (params, delay) => {
+	return new Promise((resolve, reject) => {
+		setTimeout(() => {
+			request(params, (error, response, body) => {
+				resolve({
+					error: error,
+					response: response,
+					body: body
+				});
+			});
+		}, 
+		delay);
+	});
+};
+
+function* execute() {
+	if (!fs.existsSync(outputPath)){
+		fs.mkdirSync(outputPath);
+	}
+	
+	let threads = [];
+	while(pageCount >= curPage) {
+		let threadsData = yield req({
+			uri: getForumUrl(curPage),
+			jar: jar,
+			encoding: null,
+			headers: headers
+		}, 0)
+		
+		console.log("handle page: " + curPage);
+		curPage++;
+		let $html =  $(iconv.convert(threadsData.body).toString());
+		let threadDoms = $html.find('a[href^="htm_data"][title!="打開新窗口"]');
+		console.log("threads count:" + threadDoms.length);
+		for (let i=firstPageJump; i<threadDoms.length; i++){
+			let threadDom = $(threadDoms[i]);
+			let title = threadDom.find('font').text();
+			title = title || threadDom.text();
+			threads.push({
+				url : bbsUrl + threadDom.attr('href'),
+				title: title
+			});
+		}
+	}
+		
+	console.log(threads);
+	for (let i = 0; i < workerCount; i++){
+		startWorker(threads, i);
+	}
+ }
+
+let startWorker = co.wrap(function* (threads, seq){
+	console.log("worker" + seq + " start !");
+	while (threads.length) {
+		try{
+			let thread = threads.shift();
+			console.log("save thread:" + thread.title);
+			console.log("left threads:" + threads.length);
+			let dir = outputPath + thread.title.replace(/[\*|\|\\|<|>|\?|\/|"|:]/g, '');
+			if (!fs.existsSync(dir)){
+				fs.mkdirSync(dir);
+			}
+			let threadData = yield req({
+				uri: thread.url,
+				jar: jar,
+				encoding: null,
+				headers: headers
+			}, Math.round(Math.random() * 1000));
+
+			let $html = $(iconv.convert(threadData.body).toString());
+			//console.log(iconv.convert(threadData.body).toString());
+			let $imgs = $html.find('.tpc_content:first').find('input[type=image]');
+			if ($imgs.length == 0){
+				console.log("nothing to download.");
+				continue;
+			}
+			
+			for (let i=0;i<$imgs.length;i++){
+				let lastSuccess = false;
+				let src = $imgs.eq(i).attr('src');
+				lastSuccess = yield downloadFile(src, dir, seq, lastSuccess);
+				lastSuccess = yield downloadFile(src, dir, seq, lastSuccess);
+			}
+		} catch (ex){
+			console.error(ex);
+		}
+	}
+
+	console.log("worker" + seq + " done !");
+});
+
+let downloadFile = co.wrap(function* (src, dir, seq, lastSuccess, noCheckSize){
+	if (lastSuccess){
+		return lastSuccess;
+	}
+	if (src && src.indexOf('http') === 0 ){
+		try{
+			let fileName = getFileName(src);
+			let fullFileName = dir+ '/' + fileName;
+						
+			if (fs.existsSync(fullFileName)){
+				let stats = fs.statSync(fullFileName);
+				let fileSizeInBytes = stats["size"];						 
+				let fileSizeInKB = fileSizeInBytes / 1000.0;
+				console.log("worker"+seq+" "+(new Date()).toISOString() + ' exist: ' + lastSuccess +' '+fullFileName + ' ' + fileSizeInKB +  'KB');
+				if (fileSizeInKB > 5){
+					return true;
+				}
+			}
+			console.log("worker"+seq+" "+(new Date()).toISOString() + ' download: ' + lastSuccess +' ' + src);	
+			let waitTime = lastSuccess ? Math.round(Math.random() * 600): 20;	
+			let imageData = yield req({uri:src, encoding:null, timeout: 5000}, waitTime);
+			if (imageData.error){
+				console.log("worker"+seq+" "+(new Date()).toISOString() + ' network-error: ' + lastSuccess +' ' + fullFileName);	
+				return false;
+			}
+			let body = imageData.body;
+			if (body) {
+				if (body.length <= 5000 && !noCheckSize){
+					console.log("worker"+seq+" "+(new Date()).toISOString() + ' dispose: ' + lastSuccess +' ' + fullFileName + ' ' + (body.length / 1000.0) +  'KB');	
+					return true;
+				}
+				yield new Promise((resolve, reject) => {
+					fs.writeFile(fullFileName, body, 'binary', function(err){
+						if (err) {
+							reject(err);
+							return;
+						}
+						resolve();
+					})
+				});
+				console.log("worker"+seq+" "+(new Date()).toISOString() + ' saved: ' + lastSuccess +' ' + fullFileName);	
+				return true;
+			} 
+			console.log("worker"+seq+" "+(new Date()).toISOString() + ' unknown-error: ' + lastSuccess +' ' + fullFileName);	
+			return false;
+		} catch (ex){
+			console.error(ex);
+			return false;
+		}
+	} else {
+		return false;
+	}
+	
+});
+
+let getFileName = (src) => {
+	var arr = src.split('/');
+	var result = arr[arr.length-1].replace(/[\*|\|\\|<|>|\?|\/|"|:]/g, '');
+	if (!result){
+		result = src.replace(/[\*|\|\\|<|>|\?|\/|"|:]/g, '') + '.jpg';
+	}
+	if (!/[.](jpg|png|gif|bmp|jpeg)$/.test(result)){
+		result = result + '.jpg';		
+	}
+	if (/^attachment\.php/.test(result)){
+		result = result + '.torrent';
+	}
+	return result;
+};
+
+process.on('uncaughtException', function (err) {
+  console.error(err.stack);
+});
+
+co(execute).catch(function(err){
+	console.error(err);
+});
+

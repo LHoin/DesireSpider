@@ -1,0 +1,242 @@
+'use strict';
+
+let request = require("request");
+let Iconv = require('iconv').Iconv;
+let jsdom = require("jsdom");
+let co = require("co");
+
+let fs = require('fs');
+let http = require('http');
+let https = require('https');
+
+let iconv = new Iconv('GBK', 'UTF-8//TRANSLIT//IGNORE');
+let window = jsdom.jsdom('<div></div>').defaultView;
+let jqueryConstructor = require('jquery');
+let $ = jqueryConstructor(window);
+let jar = request.jar();
+
+
+let bbsUrl = "";
+let loginUrl= bbsUrl + "/logging.php?action=login";
+let forumId = process.argv.length > 2 ? process.argv[2]:184;
+let workerCount = 3;
+let pageCount = process.argv.length > 3 ? process.argv[3]: 3;
+let curPage = 1;
+let firstPageJump = 10;
+let outputPath = '' + forumId + '/';
+
+function getForumUrl(page){
+	return bbsUrl + 'forum-'+ forumId +'-'+ page + '.html';
+}
+
+let req = (params, delay) => {
+	return new Promise((resolve, reject) => {
+		setTimeout(() => {
+			request(params, (error, response, body) => {
+				resolve({
+					error: error,
+					response: response,
+					body: body
+				});
+			});
+		}, 
+		delay);
+	});
+};
+
+function* execute() {
+	if (!fs.existsSync(outputPath)){
+		fs.mkdirSync(outputPath);
+	}
+	console.log('尝试登录。。');
+	
+	let prepareData = yield req({
+		uri: loginUrl ,
+		jar: jar,
+		encoding: null
+	});
+	
+	let $html = $(iconv.convert(prepareData.body).toString());
+	let formData = {
+		formhash: $html.find('input[name="formhash"]').val(),
+		referer: $html.find('input[name="referer"]').val(),
+		loginfield: 'uid',
+		questionid: 0,
+		answer: '',
+		cookietime: 2592000,
+		loginmode:'',
+		styleid: '',
+		loginsubmit: true		
+	};
+	formData[$html.find("#username").prop('name')] = '';
+	formData[$html.find("#password").prop('name')] = '';
+
+	console.log(formData);
+	
+	let loginData = yield req({
+		uri: loginUrl,
+		jar: jar,
+		method: 'POST',
+		form: formData,
+		encoding: null
+	}, 200);
+	
+	$html = $(iconv.convert(loginData.body).toString());
+	let message = $html.find('.box.message p').text();
+	console.log("login message: "+message);
+	
+	let threads = [];
+	while(pageCount >= curPage) {
+		let threadsData = yield req({
+			uri: getForumUrl(curPage),
+			jar: jar,
+			encoding: null
+		}, 0)
+		
+		console.log("handle page: " + curPage);
+		curPage++;
+		$html =  $(iconv.convert(threadsData.body).toString());
+		let threadDoms = $html.find('[id^="thread_"]');
+		console.log("threads count:" + threadDoms.length);
+		for (let i=firstPageJump; i<threadDoms.length; i++){
+			let threadDom = $(threadDoms[i]);
+			let link = threadDom.find('a');
+			threads.push({
+				id: threadDom.prop('id'),
+				url : bbsUrl + link.attr('href'),
+				title: link.text() 
+			});
+		}
+	}
+		
+	console.log(threads);
+	for (let i = 0; i < workerCount; i++){
+		startWorker(threads, i);
+	}
+}
+
+let startWorker = co.wrap(function* (threads, seq){
+	console.log("worker" + seq + " start !");
+	while (threads.length) {
+		try{
+			let thread = threads.shift();
+			console.log("save thread:" + thread.title);
+			console.log("left threads:" + threads.length);
+			let dir = outputPath + thread.title.replace(/[\*|\|\\|<|>|\?|\/|"|:]/g, '');
+			if (!fs.existsSync(dir)){
+				fs.mkdirSync(dir);
+			}
+			let threadData = yield req({
+				uri: thread.url,
+				jar: jar,
+				encoding: null
+			}, Math.round(Math.random() * 1000));
+
+			let $html = $(iconv.convert(threadData.body).toString());
+			let $imgs = $html.find('.postcontent:first').find('.postmessage').find('img');
+			let $attachments = $html.find('.postcontent:first').find('.t_attachlist').find('a[href^="attachment"]');
+			if ($imgs.length == 0 && $attachments.length == 0){
+				console.log("nothing to download.");
+				continue;
+			}
+			
+			for (let i=0;i<$imgs.length;i++){
+				let lastSuccess = false;
+				let src = $imgs.eq(i).attr('src');
+				lastSuccess = yield downloadFile(src, dir, seq, lastSuccess);
+				lastSuccess = yield downloadFile(src, dir, seq, lastSuccess);
+				lastSuccess = yield downloadFile(src, dir, seq, lastSuccess);
+				lastSuccess = yield downloadFile(src, dir, seq, lastSuccess);
+				lastSuccess = yield downloadFile(src, dir, seq, lastSuccess);
+				lastSuccess = yield downloadFile(src, dir, seq, lastSuccess);
+			}
+			for (let i=0;i<$attachments.length;i++){
+				let lastSuccess = false;
+				lastSuccess = yield downloadFile(bbsUrl+$attachments.eq(i).attr('href'), dir, seq, lastSuccess, true);
+			}
+		} catch (ex){
+			console.error(ex);
+		}
+	}
+
+	console.log("worker" + seq + " done !");
+});
+
+let downloadFile = co.wrap(function* (src, dir, seq, lastSuccess, noCheckSize){
+	if (lastSuccess){
+		return lastSuccess;
+	}
+	if (src && src.indexOf('http') === 0 ){
+		try{
+			let fileName = getFileName(src);
+			let fullFileName = dir+ '/' + fileName;
+						
+			if (fs.existsSync(fullFileName)){
+				let stats = fs.statSync(fullFileName);
+				let fileSizeInBytes = stats["size"];						 
+				let fileSizeInKB = fileSizeInBytes / 1000.0;
+				console.log("worker"+seq+" "+(new Date()).toISOString() + ' exist: ' + lastSuccess +' '+fullFileName + ' ' + fileSizeInKB +  'KB');
+				if (fileSizeInKB > 50){
+					return true;
+				}
+			}
+			console.log("worker"+seq+" "+(new Date()).toISOString() + ' download: ' + lastSuccess +' ' + src);	
+			let waitTime = lastSuccess ? Math.round(Math.random() * 600): 20;	
+			let imageData = yield req({uri:src, encoding:null, timeout: 5000}, waitTime);
+			if (imageData.error){
+				console.log("worker"+seq+" "+(new Date()).toISOString() + ' network-error: ' + lastSuccess +' ' + fullFileName);	
+				return false;
+			}
+			let body = imageData.body;
+			if (body) {
+				if (body.length <= 50000 && !noCheckSize){
+					console.log("worker"+seq+" "+(new Date()).toISOString() + ' dispose: ' + lastSuccess +' ' + fullFileName + ' ' + (body.length / 1000.0) +  'KB');	
+					return true;
+				}
+				yield new Promise((resolve, reject) => {
+					fs.writeFile(fullFileName, body, 'binary', function(err){
+						if (err) {
+							reject(err);
+							return;
+						}
+						resolve();
+					})
+				});
+				console.log("worker"+seq+" "+(new Date()).toISOString() + ' saved: ' + lastSuccess +' ' + fullFileName);	
+				return true;
+			} 
+			console.log("worker"+seq+" "+(new Date()).toISOString() + ' unknown-error: ' + lastSuccess +' ' + fullFileName);	
+			return false;
+		} catch (ex){
+			console.error(ex);
+			return false;
+		}
+	} else {
+		return false;
+	}
+	
+});
+
+let getFileName = (src) => {
+	var arr = src.split('/');
+	var result = arr[arr.length-1].replace(/[\*|\|\\|<|>|\?|\/|"|:]/g, '');
+	if (!result){
+		result = src.replace(/[\*|\|\\|<|>|\?|\/|"|:]/g, '') + '.jpg';
+	}
+	if (!/[.](jpg|png|gif|bmp|jpeg)$/.test(result)){
+		result = result + '.jpg';		
+	}
+	if (/^attachment\.php/.test(result)){
+		result = result + '.torrent';
+	}
+	return result;
+};
+
+process.on('uncaughtException', function (err) {
+  console.error(err.stack);
+});
+
+co(execute).catch(function(err){
+	console.error(err);
+});
+
